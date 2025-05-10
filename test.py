@@ -21,14 +21,14 @@ from sklearn.metrics import mean_squared_error
 
 # --- Конфигурация --- # ! ИЗМЕНЕНО !
 # !!! ВАЖНО: Замените на ваш реальный токен API !!!
-TINKOFF_API_TOKEN = "t.He-UEc5Mfe_E2w9CVSlZsCrqyoFacn52Yut_rwdsK8EclvfaxLlju33-26Z2cW22w0dDKNK0cNpxsyXLSGZv-g" # <--- ЗАМЕНИТЕ ВАШИМ ТОКЕНОМ
+TINKOFF_API_TOKEN = os.getenv("TOKEN")
 INSTRUMENT_FIGI = "BBG004730N88"  # <--- FIGI Сбербанка (или другого инструмента)
 DAYS_HISTORY = 1  # <--- История за 1 день
 CANDLE_TIMEFRAME = CandleInterval.CANDLE_INTERVAL_1_MIN # <--- Интервал Tinkoff (1 минута)
 
 # Параметры LSTM
 # !!! ВАЖНО: N_STEPS_IN должно быть меньше кол-ва свечей за день !!!
-N_STEPS_IN = 940  # <--- Возвращено к 2 часам (120 мин) прошлых данных
+N_STEPS_IN = 814  # <--- Возвращено к 2 часам (120 мин) прошлых данных
 N_STEPS_OUT = 60  # Предсказываем 1 час (60 мин) вперед
 
 # Параметры обучения
