@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Портфель Tinkoff</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { margin-bottom: 10px; }
+    ul { list-style: none; padding: 0; }
+    li { padding: 8px; cursor: pointer; border-bottom: 1px solid #ddd; }
+    li:hover { background: #f5f5f5; }
+    #chart-container { margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Мой портфель</h1>
+  <ul id="securities"></ul>
+  <div id="chart-container">
+    <canvas id="candleChart"></canvas>
+  </div>
+
+  <script>
+    const evtSource = new EventSource('/portfolio/stream');
+    const listEl = document.getElementById('securities');
+    let chart;
+
+    evtSource.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'initial') {
+        listEl.innerHTML = '';
+        msg.data.securities.forEach(s => {
+          const li = document.createElement('li');
+          li.textContent = `${s.figi} — баланс: ${s.balance}`;
+          li.dataset.figi = s.figi;
+          li.addEventListener('click', () => loadCandles(s.figi));
+          listEl.appendChild(li);
+        });
+      } else if (msg.type === 'update') {
+        const updated = msg.data;
+        const item = Array.from(listEl.children)
+          .find(li => li.dataset.figi === updated.figi);
+        if (item) {
+          item.textContent = `${updated.figi} — баланс: ${updated.balance}`;
+        }
+      }
+    };
+
+    async function loadCandles(figi) {
+      try {
+        const resp = await fetch(`/candles?figi=${figi}&days=1`);
+        const data = await resp.json();
+        const labels = data.map(c => new Date(c.time).toLocaleString());
+        const closes = data.map(c => c.close);
+        const ctx = document.getElementById('candleChart').getContext('2d');
+        if (chart) chart.destroy();
+        chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{ label: figi, data: closes, fill: false }]
+          },
+          options: {
+            scales: { x: { display: true }, y: { display: true } }
+          }
+        });
+      } catch (err) {
+        console.error('Ошибка при загрузке свечей:', err);
+      }
+    }
+  </script>
+</body>
+</html>
