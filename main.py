@@ -1,81 +1,114 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from tinkoff.invest import Client, CandleInterval
+from tinkoff.invest.caching.market_data_cache.cache import MarketDataCache
+from tinkoff.invest.caching.market_data_cache.cache_settings import MarketDataCacheSettings
+from tinkoff.invest.utils import now
+from pydantic import BaseModel
+from datetime import timedelta
+from pathlib import Path
+import os, json
 
 from config import TOKEN
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from tinkoff.invest import Client
-import uvicorn
-import json
-
-from fastapi.staticfiles import StaticFiles
-
-# Замените на ваш персональный токен от Tinkoff Invest API
 API_TOKEN = TOKEN
-
-# Если у вас несколько счетов, вы можете указать нужный
-# либо получать список автоматически через Client.users.get_accounts()
-ACCOUNT_ID = "2039833462"  # или строка с ID вашего счета
-
+ACCOUNT_ID = "2039833462"
 
 app = FastAPI(title="Tinkoff Portfolio Stream API")
 
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
-class MoneyPosition(BaseModel):
-    currency: str
-    units: int
-    nano: int
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-class SecurityPosition(BaseModel):
-    figi: str
-    blocked: float
-    balance: float
-    position_uid: str
-
-class PortfolioResponse(BaseModel):
-    money: list[MoneyPosition]
-    securities: list[SecurityPosition]
-
+@app.get("/", response_class=FileResponse)
+def index():
+    return "static/portfolio.html"
 
 def portfolio_generator(token: str, account_id: str):
-    """Генератор событий для SSE: шлет начальные позиции и обновления в реальном времени."""
+    """SSE: отдаём сразу всю корзину со всеми нужными полями."""
     with Client(token) as client:
-        # Получаем список аккаунтов
+        # получаем портфель для avg_price
+        port = client.operations.get_portfolio(account_id=account_id)
+        avg_price_map = {}
+        for p in port.positions:
+            try:
+                avg_price_map[p.figi] = float(p.average_position_price.value or 0)
+            except Exception:
+                continue
+
+        # получаем список аккаунтов для стрима
         resp = client.users.get_accounts()
-        accounts = [acc.id for acc in resp.accounts]
+        accounts = [a.id for a in resp.accounts]
         if account_id not in accounts:
             accounts = [account_id]
 
         stream = client.operations_stream.positions_stream(
-            accounts=accounts,
-            with_initial_positions=True
+            accounts=accounts, with_initial_positions=True
         )
-        # Проходим по каждому сообщению
         for update in stream:
-            payload = None
-            # Начальные позиции
-            if update.initial_positions:
-                init = update.initial_positions
-                money = [m.dict() for m in [MoneyPosition(currency=m.currency, units=m.units, nano=m.nano) for m in init.money]]
-                securities = [s.dict() for s in [SecurityPosition(figi=s.figi, blocked=s.blocked, balance=s.balance, position_uid=s.position_uid) for s in init.securities]]
-                payload = {"type": "initial", "data": {"money": money, "securities": securities}}
-            # Обновление отдельной позиции
-            elif update.position:
-                p = update.position
-                payload = {"type": "update", "data": {"figi": p.figi, "balance": p.balance, "blocked": p.blocked, "position_uid": p.position_uid}}
-            # Пинг или другое сообщение - пропускаем
-            if payload:
-                yield f"data: {json.dumps(payload)}\n\n"
+            if not update.initial_positions:
+                continue
+            init = update.initial_positions
+            items = []
+            total_value = 0.0
+
+            for s in init.securities:
+                figi = s.figi
+                balance = s.balance
+                avg = avg_price_map.get(figi, 0.0)
+
+                # получаем последнюю цену
+                last = client.market_data.get_last_prices(figi=[figi]).last_prices[0].price
+                curr_price = float(last.units) + last.nano / 1e9
+                pos_value = balance * curr_price
+                total_value += pos_value
+
+                # ищем инструмент по FIGI
+                resp_instr = client.market.market_search_by_figi_get(figi)
+                payload = resp_instr.payload
+                name = payload['name']
+                ticker = payload['ticker']
+
+                items.append({
+                    "figi": figi,
+                    "ticker": ticker,
+                    "name": name,
+                    "quantity": balance,
+                    "avg_price": avg,
+                    "curr_price": curr_price,
+                    "value": pos_value,
+                    "pl": pos_value - balance * avg
+                })
+
+            payload = {"type": "initial", "data": {"positions": items, "total": total_value}}
+            yield f"data: {json.dumps(payload)}\n\n"
+
 
 @app.get("/portfolio/stream")
 def stream_portfolio():
-    """Endpoint SSE для реального времени изменений портфеля."""
     try:
         return StreamingResponse(
             portfolio_generator(API_TOKEN, ACCOUNT_ID),
             media_type="text/event-stream"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка при стриминге портфеля: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/candles")
+def get_candles(figi: str, days: int = 30):
+    try:
+        with Client(API_TOKEN) as client:
+            cache = MarketDataCache(
+                settings=MarketDataCacheSettings(base_cache_dir=Path("cache")),
+                services=client
+            )
+            start = now() - timedelta(days=days)
+            candles = list(cache.get_all_candles(
+                figi=figi, from_=start, interval=CandleInterval.CANDLE_INTERVAL_DAY
+            ))
+            return JSONResponse([{
+                "time": c.time.isoformat(),
+                "open": float(c.open),
+                "close": float(c.close)
+            } for c in candles])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
