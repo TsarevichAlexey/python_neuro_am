@@ -2,49 +2,68 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Портфель Tinkoff</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
+    body { font-family: Arial; margin: 20px; }
     h1 { margin-bottom: 10px; }
     ul { list-style: none; padding: 0; }
     li { padding: 8px; cursor: pointer; border-bottom: 1px solid #ddd; }
     li:hover { background: #f5f5f5; }
     .security-item span { display: inline-block; min-width: 100px; }
-    .security-item .name { min-width: 250px; }
-    .security-item .pl.positive { color: green; }
-    .security-item .pl.negative { color: red; }
-    #chart-container { margin-top: 20px; }
-    #total-value { margin-top: 10px; font-weight: bold; }
+    .name { min-width: 250px; }
+    .pl.positive { color: green; }
+    .pl.negative { color: red; }
+    #chart-container, #forecast-container { margin-top: 20px; }
+    canvas { max-height: 400px; }
+    #forecast-btn {
+      margin-top: 10px;
+      padding: 8px 12px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #forecast-btn:hover {
+      background-color: #0056b3;
+    }
+    #forecast-btn:disabled {
+      background-color: #cccccc;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
   <h1>Мой портфель</h1>
   <div id="total-value">Общая стоимость: ...</div>
   <ul id="securities"></ul>
+
   <div id="chart-container">
     <canvas id="candleChart"></canvas>
+    <button id="forecast-btn" style="display:none;">Прогнозировать цену</button>
+  </div>
+
+  <div id="forecast-container">
+    <canvas id="forecastChart"></canvas>
   </div>
 
   <script>
     const evtSource = new EventSource('/portfolio/stream');
     const listEl = document.getElementById('securities');
     const totalValueEl = document.getElementById('total-value');
-    let chart;
+    const forecastBtn = document.getElementById('forecast-btn');
+    let chart, forecastChart, selectedFigi = null, selectedTicker = null;
 
     evtSource.onmessage = (e) => {
-      console.log("Received SSE:", e.data); // Для отладки
       const msg = JSON.parse(e.data);
       if (msg.type === 'initial') {
-        listEl.innerHTML = ''; // Очищаем список перед заполнением
-        const portfolioData = msg.data; // msg.data содержит {positions: [...], total: ...}
-
+        listEl.innerHTML = '';
+        const portfolioData = msg.data;
         if (portfolioData && portfolioData.positions) {
-          portfolioData.positions.forEach(s => { // Используем portfolioData.positions
+          portfolioData.positions.forEach(s => {
             const li = document.createElement('li');
             li.classList.add('security-item');
-            // Отображаем больше информации
             li.innerHTML = `
               <span class="ticker">${s.ticker}</span>
               <span class="name">${s.name}</span>
@@ -54,85 +73,145 @@
               <span class="value">Стоимость: ${s.value.toFixed(2)}</span>
               <span class="pl ${s.pl >= 0 ? 'positive' : 'negative'}">P/L: ${s.pl.toFixed(2)}</span>
             `;
-            li.dataset.figi = s.figi; // FIGI для загрузки свечей
-            li.dataset.ticker = s.ticker; // Ticker для заголовка графика
-            li.addEventListener('click', () => loadCandles(s.figi, s.ticker));
+            li.dataset.figi = s.figi;
+            li.dataset.ticker = s.ticker;
+            li.addEventListener('click', () => {
+              selectedFigi = s.figi;
+              selectedTicker = s.ticker;
+              loadCandles(selectedFigi, selectedTicker);
+              forecastBtn.style.display = 'inline-block'; // Показываем кнопку
+               // Очищаем график прогноза при выборе нового инструмента
+              if (forecastChart) {
+                forecastChart.destroy();
+                forecastChart = null;
+                document.getElementById('forecastChart').getContext('2d').clearRect(0, 0, document.getElementById('forecastChart').width, document.getElementById('forecastChart').height); // Очистка canvas
+              }
+            });
             listEl.appendChild(li);
           });
           totalValueEl.textContent = `Общая стоимость портфеля: ${portfolioData.total.toFixed(2)}`;
-        } else {
-          console.error("Получены некорректные данные 'initial':", msg);
-        }
-
-      } else if (msg.type === 'update') {
-        // Этот блок пока не используется, так как бэкенд шлет только 'initial'
-        const updated = msg.data;
-        const item = Array.from(listEl.children)
-          .find(li => li.dataset.figi === updated.figi);
-        if (item) {
-          // Обновите содержимое li здесь, если бэкенд будет слать 'update'
-          // Например:
-          // item.querySelector('.quantity').textContent = `Кол-во: ${updated.quantity}`;
-          // item.querySelector('.curr-price').textContent = `Текущая: ${updated.curr_price.toFixed(2)}`;
-          // ... и так далее для всех полей
-          console.log("Получено обновление (не обработано):", updated);
         }
       }
     };
 
     evtSource.onerror = (err) => {
-        console.error("EventSource failed:", err);
-        evtSource.close(); // Можно закрыть, чтобы не пытаться переподключаться бесконечно
+      console.error("EventSource error:", err);
+      // Можно добавить логику переподключения или уведомления пользователя
+      // evtSource.close(); // Закрывать или нет - зависит от стратегии обработки ошибок
     };
 
-    async function loadCandles(figi, ticker) { // Добавим ticker для заголовка
+    async function loadCandles(figi, ticker) {
       try {
-        const resp = await fetch(`/candles?figi=${figi}&days=30`); // Увеличим дни для наглядности
-        if (!resp.ok) {
-            const errorData = await resp.json();
-            throw new Error(`Ошибка сервера: ${resp.status} - ${errorData.detail || resp.statusText}`);
-        }
+        const resp = await fetch(`/candles?figi=${figi}&days=30`);
+        if (!resp.ok) throw new Error(`Ошибка загрузки свечей: ${resp.status} ${resp.statusText}`);
         const data = await resp.json();
-        if (!Array.isArray(data) || data.length === 0) {
-            console.warn("Нет данных по свечам для", figi);
-            if (chart) chart.destroy(); // Очищаем старый график, если нет новых данных
-            document.getElementById('candleChart').getContext('2d').clearRect(0,0,document.getElementById('candleChart').width,document.getElementById('candleChart').height); // Очищаем canvas
-            return;
-        }
-        const labels = data.map(c => new Date(c.time).toLocaleDateString()); // Более читаемый формат даты
+        if (!Array.isArray(data)) throw new Error("Данные свечей пришли в неверном формате.");
+
+        const labels = data.map(c => new Date(c.time).toLocaleDateString());
         const closes = data.map(c => c.close);
         const ctx = document.getElementById('candleChart').getContext('2d');
 
-        if (chart) {
-          chart.destroy();
-        }
-
+        if (chart) chart.destroy();
         chart = new Chart(ctx, {
           type: 'line',
           data: {
-            labels: labels,
+            labels,
             datasets: [{
-              label: `Цена закрытия ${ticker || figi}`, // Используем ticker
+              label: `Цена закрытия ${ticker}`,
               data: closes,
-              fill: false,
               borderColor: 'rgb(75, 192, 192)',
               tension: 0.1
             }]
           },
           options: {
             responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-              x: { display: true, title: { display: true, text: 'Дата' } },
-              y: { display: true, title: { display: true, text: 'Цена' } }
-            }
+            maintainAspectRatio: false
           }
         });
       } catch (err) {
-        console.error('Ошибка при загрузке свечей:', err);
-        alert(`Не удалось загрузить свечи: ${err.message}`);
+        console.error("Ошибка при загрузке свечей:", err);
+        alert(`Ошибка при загрузке свечей: ${err.message}`);
       }
     }
+
+    forecastBtn.addEventListener('click', async () => {
+      if (!selectedFigi) {
+        alert("Сначала выберите инструмент из портфеля.");
+        return;
+      }
+      forecastBtn.textContent = 'Загрузка прогноза...';
+      forecastBtn.disabled = true;
+
+      // Очищаем предыдущий график прогноза
+      if (forecastChart) {
+          forecastChart.destroy();
+          forecastChart = null;
+          document.getElementById('forecastChart').getContext('2d').clearRect(0, 0, document.getElementById('forecastChart').width, document.getElementById('forecastChart').height);
+      }
+
+      try {
+        // ИЗМЕНЕНО: GET-запрос с FIGI в URL
+        const response = await fetch(`/forecast?figi=${selectedFigi}`, {
+          method: 'GET' // Указываем GET, body и headers для JSON не нужны
+        });
+
+        if (!response.ok) {
+          let errorDetail = "Неизвестная ошибка сервера.";
+          try {
+            const errJson = await response.json(); // FastAPI возвращает JSON для HTTPException
+            errorDetail = errJson.detail || response.statusText;
+          } catch (e) {
+            errorDetail = response.statusText; // Если ответ не JSON
+          }
+          throw new Error(`Ошибка ${response.status}: ${errorDetail}`);
+        }
+
+        const forecastResult = await response.json(); // Ожидаем {times: [], prices: []}
+
+        // Проверяем, что forecastResult и его поля существуют
+        if (!forecastResult || !Array.isArray(forecastResult.times) || !Array.isArray(forecastResult.prices)) {
+            throw new Error("Получены некорректные данные прогноза.");
+        }
+
+        const labels = forecastResult.times.map(ts => new Date(ts).toLocaleString()); // Более читаемый формат
+        const data = forecastResult.prices;
+
+        const ctx = document.getElementById('forecastChart').getContext('2d');
+        // if (forecastChart) forecastChart.destroy(); // Уже сделано выше
+        forecastChart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{
+              label: `Прогноз цены ${selectedTicker || selectedFigi}`,
+              data,
+              borderColor: 'rgb(255, 99, 132)',
+              tension: 0.3
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: {
+                ticks: {
+                  autoSkip: true,
+                  maxRotation: 70,
+                  minRotation: 0,
+                  maxTicksLimit: 15 // Чтобы не было слишком много меток
+                }
+              }
+            }
+          }
+        });
+      } catch (e) {
+        console.error('Ошибка прогноза:', e);
+        alert('Ошибка прогноза: ' + e.message);
+      } finally {
+        forecastBtn.textContent = 'Прогнозировать цену';
+        forecastBtn.disabled = false;
+      }
+    });
   </script>
 </body>
 </html>
